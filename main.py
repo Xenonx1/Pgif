@@ -4,6 +4,7 @@ import logging
 import os
 import random
 import time
+from collections import OrderedDict
 from urllib.parse import quote
 
 import httpx
@@ -45,6 +46,23 @@ client = httpx.AsyncClient(
 
 _cache: dict = {}
 
+MEDIA_CACHE_MAX = int(os.getenv("MEDIA_CACHE_MB", "150")) * 1024 * 1024
+_media_cache: "OrderedDict[str, tuple[bytes, str]]" = OrderedDict()
+_media_size = 0
+
+
+def _media_put(url: str, body: bytes, ctype: str) -> None:
+    global _media_size
+    if len(body) > MEDIA_CACHE_MAX // 10:  # skip very large files
+        return
+    if url in _media_cache:
+        _media_size -= len(_media_cache.pop(url)[0])
+    _media_cache[url] = (body, ctype)
+    _media_size += len(body)
+    while _media_size > MEDIA_CACHE_MAX and _media_cache:  # evict least recently used
+        _, (old, _) = _media_cache.popitem(last=False)
+        _media_size -= len(old)
+
 
 def proxied(url: str) -> str:
     """Serve media via this service so Telegram doesn't hit the CDN directly."""
@@ -58,6 +76,12 @@ async def media(request: web.Request):
     good = hmac.new(SECRET.encode(), url.encode(), hashlib.sha256).hexdigest()[:20]
     if not url.startswith("https://") or not hmac.compare_digest(sig, good):
         return web.Response(status=403)
+    hit = _media_cache.get(url)
+    if hit:
+        _media_cache.move_to_end(url)
+        return web.Response(
+            body=hit[0], content_type=hit[1], headers={"Cache-Control": "public, max-age=86400"}
+        )
     try:
         r = await client.get(url, headers={"Referer": SITE + "/"})
     except httpx.HTTPError:
@@ -65,9 +89,11 @@ async def media(request: web.Request):
     if r.status_code != 200:
         log.warning("media HTTP %s for %s", r.status_code, url[:80])
         return web.Response(status=502)
+    ctype = r.headers.get("content-type", "application/octet-stream").split(";")[0]
+    _media_put(url, r.content, ctype)
     return web.Response(
         body=r.content,
-        content_type=r.headers.get("content-type", "application/octet-stream").split(";")[0],
+        content_type=ctype,
         headers={"Cache-Control": "public, max-age=86400"},
     )
 
